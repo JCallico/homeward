@@ -538,6 +538,7 @@ async function descend(loc, { quick = false } = {}) {
   const token = ++state.flight;
   state.home = loc;
   state.phase = 'flying';
+  sound.settle();
   state.titleStage = -1;
   shownTitles.clear();
   MILESTONES.forEach((m) => m.el.classList.remove('passed'));
@@ -584,6 +585,7 @@ function land() {
   document.body.classList.add('landed');
   placeBeacon(state.home, precisionOf(state.home) === 'spot');
   sound.chime();
+  sound.settle();   // drop the wind to a breeze now that we are down
   const [kicker, main] = landingTitle();
   titleCard(kicker, main, 4200);
   fillCard();
@@ -868,65 +870,112 @@ async function visit(a) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Sound: a slow pad in orbit, wind as the atmosphere thickens         */
+/* Sound: a slow chord in orbit, wind as the atmosphere thickens, a    */
+/* chime on landing. Pitched for small speakers, not just headphones.  */
 /* ------------------------------------------------------------------ */
 const sound = (() => {
-  let ctx, master, wind, windFilter, on = false;
+  let ctx, master, padBus, padFilter, wind, windFilter, on = false, lastAlt = null, lastT = 0;
   function build() {
+    // iOS: let Web Audio play even when the ring/silent switch is on silent
+    try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch {}
     ctx = new (window.AudioContext || window.webkitAudioContext)();
-    master = ctx.createGain(); master.gain.value = 0; master.connect(ctx.destination);
-    const verb = ctx.createConvolver(); verb.buffer = impulse(3.5); verb.connect(master);
-    const dry = ctx.createGain(); dry.gain.value = 0.5; dry.connect(master);
-    // pad: an open fifth with a gently beating ninth
-    const pad = ctx.createGain(); pad.gain.value = 0.05; pad.connect(verb); pad.connect(dry);
-    const lp = ctx.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 900; lp.connect(pad);
-    [110, 164.81, 246.94, 220.6].forEach((f, i) => {
-      const o = ctx.createOscillator(); o.type = i % 2 ? 'triangle' : 'sine'; o.frequency.value = f;
-      const lfo = ctx.createOscillator(); lfo.frequency.value = 0.05 + i * 0.03;
-      const lg = ctx.createGain(); lg.gain.value = 3; lfo.connect(lg); lg.connect(o.detune);
-      o.connect(lp); o.start(); lfo.start();
+
+    // master → gentle compressor → speakers, so swells stay loud without clipping
+    const comp = ctx.createDynamicsCompressor();
+    comp.threshold.value = -10; comp.knee.value = 10; comp.ratio.value = 3; comp.attack.value = 0.02; comp.release.value = 0.4;
+    master = ctx.createGain(); master.gain.value = 0;   // toggled to 0.8
+    master.connect(comp); comp.connect(ctx.destination);
+    const verb = ctx.createConvolver(); verb.buffer = impulse(3.2);
+    const verbGain = ctx.createGain(); verbGain.gain.value = 0.55;
+    verb.connect(verbGain); verbGain.connect(master);
+    const dry = ctx.createGain(); dry.gain.value = 0.8; dry.connect(master);
+
+    // the chord: A major add9 spread over three octaves; mid voices carry it on laptop/phone speakers
+    padBus = ctx.createGain(); padBus.gain.value = 0.7;
+    padFilter = ctx.createBiquadFilter(); padFilter.type = 'lowpass'; padFilter.frequency.value = 1600; padFilter.Q.value = 0.4;
+    padFilter.connect(padBus); padBus.connect(verb); padBus.connect(dry);
+    const voices = [[110, 0.10, 'sine'], [220, 0.16, 'triangle'], [329.63, 0.15, 'triangle'], [440, 0.11, 'sine'],
+      [554.37, 0.09, 'triangle'], [659.25, 0.07, 'sine'], [987.77, 0.035, 'sine']];
+    voices.forEach(([f, g, type], i) => {
+      const o = ctx.createOscillator(); o.type = type; o.frequency.value = f;
+      const drift = ctx.createOscillator(); drift.frequency.value = 0.07 + i * 0.023;   // slow chorus
+      const dg = ctx.createGain(); dg.gain.value = 4; drift.connect(dg); dg.connect(o.detune);
+      const amp = ctx.createGain(); amp.gain.value = g;
+      const swell = ctx.createOscillator(); swell.frequency.value = 0.045 + i * 0.017;   // each voice breathes on its own
+      const sg = ctx.createGain(); sg.gain.value = g * 0.45; swell.connect(sg); sg.connect(amp.gain);
+      o.connect(amp); amp.connect(padFilter);
+      o.start(); drift.start(); swell.start();
     });
-    // wind: brown noise through a moving band-pass
-    const len = ctx.sampleRate * 4, buf = ctx.createBuffer(1, len, ctx.sampleRate), d = buf.getChannelData(0);
-    let last = 0;
-    for (let i = 0; i < len; i++) { last = (last + 0.02 * (Math.random() * 2 - 1)) / 1.02; d[i] = last * 3.5; }
+
+    // wind: normalised pink-ish noise through a band-pass that rises and opens as we fall
+    const len = ctx.sampleRate * 6, buf = ctx.createBuffer(2, len, ctx.sampleRate);
+    for (let c = 0; c < 2; c++) {
+      const d = buf.getChannelData(c);
+      let b0 = 0, b1 = 0, b2 = 0, peak = 0;
+      for (let i = 0; i < len; i++) {
+        const w = Math.random() * 2 - 1;
+        b0 = 0.99765 * b0 + w * 0.099; b1 = 0.963 * b1 + w * 0.2965; b2 = 0.57 * b2 + w * 1.0526;
+        d[i] = b0 + b1 + b2 + w * 0.1848; peak = Math.max(peak, Math.abs(d[i]));
+      }
+      for (let i = 0; i < len; i++) d[i] *= 0.9 / peak;
+    }
     const src = ctx.createBufferSource(); src.buffer = buf; src.loop = true;
-    windFilter = ctx.createBiquadFilter(); windFilter.type = 'bandpass'; windFilter.Q.value = 0.8; windFilter.frequency.value = 400;
+    windFilter = ctx.createBiquadFilter(); windFilter.type = 'bandpass'; windFilter.Q.value = 0.6; windFilter.frequency.value = 500;
+    const gust = ctx.createOscillator(); gust.frequency.value = 0.21;          // gusts sweep the band up and down
+    const gg = ctx.createGain(); gg.gain.value = 180; gust.connect(gg); gg.connect(windFilter.frequency);
     wind = ctx.createGain(); wind.gain.value = 0;
-    src.connect(windFilter); windFilter.connect(wind); wind.connect(verb); wind.connect(dry); src.start();
+    src.connect(windFilter); windFilter.connect(wind); wind.connect(dry); wind.connect(verb);
+    src.start(); gust.start();
   }
   function impulse(sec) {
     const len = ctx.sampleRate * sec, b = ctx.createBuffer(2, len, ctx.sampleRate);
     for (let c = 0; c < 2; c++) { const d = b.getChannelData(c); for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * (1 - i / len) ** 3; }
     return b;
   }
+  function bell(freqs, level = 0.22, gap = 0.12) {
+    const t = ctx.currentTime + 0.05;
+    freqs.forEach((f, i) => {
+      [1, 2.76].forEach((partial, k) => {     // a struck tone: fundamental plus a bright inharmonic partial
+        const o = ctx.createOscillator(), g = ctx.createGain(), start = t + i * gap;
+        o.type = 'sine'; o.frequency.value = f * partial;
+        const peak = level * (k ? 0.25 : 1);
+        g.gain.setValueAtTime(0, start); g.gain.linearRampToValueAtTime(peak, start + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, start + (k ? 1.2 : 3.8));
+        o.connect(g); g.connect(master); o.start(start); o.stop(start + 4);
+      });
+    });
+  }
+  /** Mix for the current moment: chord always, wind with the atmosphere and the speed of the fall. */
+  function mix(alt) {
+    if (!ctx || !on) return;
+    const now = ctx.currentTime;
+    const p = altPos(alt), atm = Math.max(0, Math.min(1, (p - 0.4) / 0.5));
+    // how fast we are falling, in decades of altitude per second
+    let speed = 0;
+    if (lastAlt && now > lastT) speed = Math.abs(Math.log10(lastAlt) - Math.log10(alt)) / (now - lastT);
+    lastAlt = alt; lastT = now;
+    let w;
+    if (state.phase === 'flying') w = 0.15 + 1.5 * Math.sin(atm * Math.PI) + Math.min(0.6, speed) * atm;
+    else if (state.phase === 'landed') w = 0.12;            // a light breeze at ground level
+    else w = 0.04;                                          // orbit: almost silence, just the chord
+    wind.gain.setTargetAtTime(Math.min(2, w), now, 0.35);
+    windFilter.frequency.setTargetAtTime(380 + atm * 1100, now, 0.4);
+    padFilter.frequency.setTargetAtTime(state.phase === 'flying' ? 1200 + atm * 1800 : 1600, now, 1.2);
+    // the chord steps back while the wind roars through the atmosphere
+    padBus.gain.setTargetAtTime(state.phase === 'flying' ? 0.7 - Math.sin(atm * Math.PI) * 0.4 : 0.7, now, 1.2);
+  }
   return {
     toggle() {
       on = !on;
       if (on && !ctx) build();
       ctx?.resume();
-      master?.gain.setTargetAtTime(on ? 0.9 : 0, ctx.currentTime, 0.8);
+      master?.gain.setTargetAtTime(on ? 0.8 : 0, ctx.currentTime, on ? 0.25 : 0.4);
+      if (on) { lastAlt = null; mix(altitudeMeters()); bell([880, 1318.5], 0.16, 0.09); }   // immediate, audible confirmation
       return on;
     },
-    altitude(m) {
-      if (!ctx || !on) return;
-      // wind swells between the Kármán line and the clouds, then settles near the ground
-      const p = altPos(m), atm = Math.max(0, Math.min(1, (p - 0.45) / 0.45));
-      const g = state.phase === 'flying' ? Math.sin(atm * Math.PI) * 0.35 + 0.02 : 0.015;
-      wind.gain.setTargetAtTime(g, ctx.currentTime, 0.4);
-      windFilter.frequency.setTargetAtTime(250 + atm * 900, ctx.currentTime, 0.4);
-    },
-    chime() {
-      if (!ctx || !on) return;
-      const t = ctx.currentTime;
-      [659.25, 987.77, 1318.5].forEach((f, i) => {
-        const o = ctx.createOscillator(), g = ctx.createGain();
-        o.frequency.value = f; o.type = 'sine';
-        g.gain.setValueAtTime(0, t + i * 0.12); g.gain.linearRampToValueAtTime(0.08, t + i * 0.12 + 0.02);
-        g.gain.exponentialRampToValueAtTime(0.0001, t + i * 0.12 + 3.5);
-        o.connect(g); g.connect(master); o.start(t + i * 0.12); o.stop(t + 4);
-      });
-    },
+    altitude: mix,
+    settle() { mix(altitudeMeters()); },
+    chime() { if (ctx && on) bell([659.25, 987.77, 1318.5]); },
   };
 })();
 
