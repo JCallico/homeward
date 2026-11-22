@@ -31,6 +31,15 @@ Browsers only expose precise device location on `https://` or `localhost`.
 2. **IP geolocation** (ipwho.is, GeoJS, whichever answers first) gives a city-level fix, and the descent starts from that.
 3. **Device geolocation** (GPS/Wi-Fi, `enableHighAccuracy`) refines the landing as it improves. If it arrives mid-flight, the camera bends to the new target. If it arrives after landing, the camera glides over.
 
+Homeward never claims more precision than it has. Every fix is classed as a
+**spot**, **city**, **region**, **country** or **time zone**, and the landing
+stops at that level:
+
+- **Spot** (a device fix within ~300 m, or a shared pin): lands at the deepest available imagery, with a beacon and the neighbourhood name.
+- **Area** (IP geolocation, or a coarse device fix): frames the whole uncertainty circle top-down. It shows only names it can vouch for (the city reported by the IP provider, not a street reverse-geocoded from its centroid) and gives the uncertainty in place of the elevation. Share links carry the radius too (`#@lat,lon,~metres`).
+
+If a better fix arrives later, the camera sharpens from the area to the spot.
+
 Imagery depth is probed per location with Esri's `tilemap` service. Where
 z20–z23 tiles exist, a detail layer is added and the camera lands that deep.
 

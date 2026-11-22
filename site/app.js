@@ -19,6 +19,41 @@ const isPhone = () => innerWidth < 720;
 const landingPadding = () => isPhone() ? { top: 60, bottom: 200, left: 0, right: 0 } : { top: 0, bottom: 60, left: 0, right: Math.min(440, innerWidth * 0.35) };
 const NO_PADDING = { top: 0, bottom: 0, left: 0, right: 0 };
 
+/**
+ * How much do we actually know? Everything downstream (names, camera, beacon,
+ * card) stops at this level, so an approximate fix never pretends to be an address.
+ *   spot    – a specific place (device fix or shared pin)
+ *   city    – IP geolocation, or a coarse device fix
+ *   region  – province/state level
+ *   country – country only
+ *   world   – nothing but the clock's time zone
+ */
+const LEVELS = ['world', 'country', 'region', 'city', 'spot'];
+function precisionOf(loc) {
+  if (!loc) return 'world';
+  if (loc.source === 'tz') return 'world';
+  const a = loc.accuracy ?? Infinity;
+  if (a <= 300) return 'spot';
+  if (a <= 40_000) return 'city';
+  if (a <= 300_000) return 'region';
+  if (a <= 1_500_000) return 'country';
+  return 'world';
+}
+const knows = (loc, level) => LEVELS.indexOf(precisionOf(loc)) >= LEVELS.indexOf(level);
+
+/** Only the names the precision can vouch for. */
+function knownPlace(p = {}, loc = state.home) {
+  return {
+    continent: p.continent,
+    country: knows(loc, 'country') ? p.country : undefined,
+    region: knows(loc, 'region') ? p.region : undefined,
+    city: knows(loc, 'city') ? p.city : undefined,
+    hood: knows(loc, 'spot') ? p.hood : undefined,
+    ocean: knows(loc, 'spot') ? p.ocean : undefined,
+  };
+}
+const tzPlace = () => (Intl.DateTimeFormat().resolvedOptions().timeZone || '').split('/').pop().replace(/_/g, ' ');
+
 const state = {
   home: null,          // { lat, lon, accuracy, source: 'gps'|'ip'|'tz'|'shared' }
   place: {},           // reverse-geocoded names
@@ -246,7 +281,7 @@ function titleCard(kicker, main, hold = 3600) {
 /** As we fall, name each layer of "where": planet, country, region, city, neighbourhood. */
 const shownTitles = new Set();
 function storyTitles(alt) {
-  const p = state.place;
+  const p = knownPlace(state.place);
   const stages = [
     { alt: 9_000_000, kicker: 'The third planet from the Sun', main: 'Earth' },
     { alt: 4_500_000, kicker: p.continent, main: p.country || p.ocean },
@@ -292,7 +327,9 @@ async function ipLocate() {
   ];
   const r = await Promise.any(providers);
   if (!isFinite(r.lat) || !isFinite(r.lon)) throw new Error('bad ip fix');
-  return { ...r, accuracy: 15_000, source: 'ip' };
+  // IP geolocation has no error bars; size the uncertainty by the finest name it resolved.
+  const accuracy = r.city ? 25_000 : r.region ? 200_000 : r.country ? 800_000 : 2_000_000;
+  return { ...r, accuracy, source: 'ip' };
 }
 
 let watchId = null;
@@ -315,11 +352,11 @@ function gpsWatch(onFix, onDenied) {
 }
 
 function parseShared() {
-  const m = location.hash.match(/^#@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)/);
+  const m = location.hash.match(/^#@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)(?:,~(\d+))?/);
   if (!m) return null;
   const lat = +m[1], lon = +m[2];
   if (Math.abs(lat) > 90 || Math.abs(lon) > 180) return null;
-  return { lat, lon, accuracy: 10, source: 'shared' };
+  return { lat, lon, accuracy: m[3] ? Math.min(+m[3], 2_000_000) : 10, source: 'shared' };
 }
 
 async function begin() {
@@ -448,6 +485,21 @@ function useDeepImagery(maxTile) {
   map.addLayer({ id: 'sat-deep', type: 'raster', source: 'sat-deep', minzoom: BASE_TILE_MAX - 0.4, paint: { 'raster-fade-duration': 300 } }, 'night');
 }
 
+/** Zoom at which a circle of the fix's accuracy fills the open part of the screen. */
+function zoomToFit(loc) {
+  const pad = landingPadding(), cv = map.getCanvas();
+  const w = cv.clientWidth - pad.left - pad.right, h = cv.clientHeight - pad.top - pad.bottom;
+  const span = 2 * Math.max(loc.accuracy || 0, 1) * 1.35;          // diameter plus a margin
+  const mpp = span / Math.max(120, Math.min(w, h));
+  return Math.log2(EARTH_C * Math.cos(loc.lat * Math.PI / 180) / (512 * mpp));
+}
+function landingCamera(loc, maxTile) {
+  const deep = Math.max(11, Math.min(21, maxTile - 1 + 0.15));
+  const spot = precisionOf(loc) === 'spot';
+  const zoom = Math.max(ORBIT_ZOOM + 0.6, Math.min(deep, zoomToFit(loc)));
+  return { center: [loc.lon, loc.lat], zoom, pitch: spot ? 48 : 0, bearing: spot ? -18 : 0, padding: landingPadding() };
+}
+
 async function descend(loc, { quick = false } = {}) {
   const token = ++state.flight;
   state.home = loc;
@@ -465,7 +517,8 @@ async function descend(loc, { quick = false } = {}) {
   setAccuracy(loc);
   placeBeacon(loc, false);
 
-  const depth = deepestTile(loc.lat, loc.lon);
+  const spot = precisionOf(loc) === 'spot';
+  const depth = spot ? deepestTile(loc.lat, loc.lon) : Promise.resolve(BASE_TILE_MAX);
   geocode(loc).then((p) => {
     if (token !== state.flight) return;
     state.place = p;
@@ -478,14 +531,15 @@ async function descend(loc, { quick = false } = {}) {
     if (!ok) return;
   }
   // 2. the long fall
-  const ok2 = await camera('flyTo', { center: [loc.lon, loc.lat], zoom: 16.4, pitch: 0, bearing: 0, duration: REDUCED ? 2000 : quick ? 6000 : 15000, curve: 1.2, easing: easeInOutSoft });
+  const ok2 = await camera('flyTo', { center: [loc.lon, loc.lat], zoom: Math.min(16.4, landingCamera(loc, BASE_TILE_MAX).zoom), pitch: 0, bearing: 0, padding: spot ? NO_PADDING : landingPadding(), duration: REDUCED ? 2000 : quick ? 6000 : 15000, curve: 1.2, easing: easeInOutSoft });
   if (!ok2) return;
-  // 3. touch down — as deep as the imagery goes — and lean into the view
+  // 3. touch down: as deep as the imagery goes for a real spot, or framing the whole area we know
   const maxTile = await depth;
   if (token !== state.flight) return;
-  useDeepImagery(maxTile);
-  state.finalZoom = Math.max(11, Math.min(21, maxTile - 1 + 0.15));
-  const ok3 = await camera('easeTo', { center: [loc.lon, loc.lat], zoom: state.finalZoom, pitch: 48, bearing: -18, padding: landingPadding(), duration: REDUCED ? 800 : 5200, easing: easeOutQuint });
+  useDeepImagery(spot ? maxTile : BASE_TILE_MAX);
+  const cam = landingCamera(loc, maxTile);
+  state.finalZoom = cam.zoom;
+  const ok3 = await camera('easeTo', { ...cam, duration: REDUCED ? 800 : 5200, easing: easeOutQuint });
   if (!ok3) return;
   land();
 }
@@ -494,9 +548,10 @@ function land() {
   state.phase = 'landed';
   document.body.classList.remove('flying');
   document.body.classList.add('landed');
-  placeBeacon(state.home, true);
+  placeBeacon(state.home, precisionOf(state.home) === 'spot');
   sound.chime();
-  titleCard(state.shared && state.home.source === 'shared' ? 'Someone wanted you to see this' : (state.place.city || state.place.country || ''), state.shared && state.home.source === 'shared' ? 'Here.' : 'You are here.', 4200);
+  const [kicker, main] = landingTitle();
+  titleCard(kicker, main, 4200);
   fillCard();
   $('card').hidden = false; $('dock').hidden = false;
   $('card').classList.toggle('collapsed', isPhone());
@@ -504,24 +559,42 @@ function land() {
   drift(true);
 }
 
+function landingTitle() {
+  const loc = state.home, p = knownPlace(state.place);
+  if (loc.source === 'shared' && state.shared) return ['Someone wanted you to see this', precisionOf(loc) === 'spot' ? 'Here.' : (p.city || p.region || p.country || 'Around here.')];
+  switch (precisionOf(loc)) {
+    case 'spot': return [p.city || p.country || '', 'You are here.'];
+    case 'city': return ['You are somewhere in', p.city || p.region || p.country || 'this area'];
+    case 'region': return ['You are somewhere in', p.region || p.country || 'this region'];
+    case 'country': return ['You are somewhere in', p.country || 'this country'];
+    default: return ['Somewhere in the time zone of', tzPlace() || 'this part of the world'];
+  }
+}
+
 /** A better fix arrived after we set off. */
 function retarget(fix) {
   const prev = state.home;
   if (state.shared && prev?.source === 'shared') return;   // never yank a shared view away
-  if (prev && prev.source !== 'gps') toast(`Precise fix acquired · ±${fmtDist(fix.accuracy)}`);
   const moved = prev ? haversine(prev, fix) : Infinity;
+  const sharper = !prev || LEVELS.indexOf(precisionOf(fix)) > LEVELS.indexOf(precisionOf(prev));
+  const better = !prev || fix.accuracy < prev.accuracy / 1.5;
+  if (prev && prev.source !== 'gps') toast(precisionOf(fix) === 'spot' ? `Precise fix acquired · ±${fmtDist(fix.accuracy)}` : `Device location · ±${fmtDist(fix.accuracy)}`);
   state.home = fix;
   setAccuracy(fix);
   refreshPrecision();
-  if (state.phase === 'flying' && moved > 25) return descend(fix, { quick: true });
-  if (state.phase === 'landed' && moved > 8) {
-    placeBeacon(fix, true);
+  if (state.phase === 'flying' && (moved > 25 || sharper)) return descend(fix, { quick: true });
+  if (state.phase === 'landed' && (moved > 8 || sharper || better)) {
+    const token = state.flight;
+    placeBeacon(fix, precisionOf(fix) === 'spot');
     poem(fix);
-    geocode(fix).then((p) => { state.place = p; fillCard(); });
-    deepestTile(fix.lat, fix.lon).then((t) => {
-      useDeepImagery(t);
-      state.finalZoom = Math.max(11, Math.min(21, t - 1 + 0.15));
-      map.easeTo({ center: [fix.lon, fix.lat], zoom: state.finalZoom, padding: landingPadding(), duration: 2400, essential: true });
+    geocode(fix).then((p) => { if (token === state.flight) { state.place = p; fillCard(); } });
+    const depth = precisionOf(fix) === 'spot' ? deepestTile(fix.lat, fix.lon) : Promise.resolve(BASE_TILE_MAX);
+    depth.then((t) => {
+      if (token !== state.flight) return;
+      useDeepImagery(precisionOf(fix) === 'spot' ? t : BASE_TILE_MAX);
+      const cam = landingCamera(fix, t);
+      state.finalZoom = cam.zoom;
+      map.easeTo({ ...cam, duration: 3200, essential: true });
     });
   }
 }
@@ -585,7 +658,7 @@ function placeBeacon(loc, visible) {
 function setAccuracy(loc) {
   const src = map.getSource('accuracy');
   if (!src) return;
-  if (!loc || loc.accuracy < 20 || loc.source === 'shared' || loc.source === 'tz') {
+  if (!loc || loc.accuracy < 20 || loc.source === 'tz') {
     src.setData({ type: 'FeatureCollection', features: [] }); return;
   }
   const pts = [], R = 6_371_008.8, d = loc.accuracy / R, r = Math.PI / 180;
@@ -603,10 +676,22 @@ function setAccuracy(loc) {
 /* Names, weather, ground                                              */
 /* ------------------------------------------------------------------ */
 async function geocode(loc) {
+  const coarse = precisionOf(loc) !== 'spot';
   const [osm, bdc] = await Promise.allSettled([
-    getJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${loc.lat}&lon=${loc.lon}&zoom=18&addressdetails=1&accept-language=${LANG}`, 7000),
+    coarse ? Promise.reject(new Error('skip')) : getJSON(`https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${loc.lat}&lon=${loc.lon}&zoom=18&addressdetails=1&accept-language=${LANG}`, 7000),
     getJSON(`https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${loc.lat}&longitude=${loc.lon}&localityLanguage=${LANG}`, 7000),
   ]);
+  if (precisionOf(loc) !== 'spot') {
+    // An approximate fix: the coordinate is a centroid, not where anyone stands. Use the names
+    // the locator itself reported, and only borrow coarser names from a reverse lookup.
+    const b = bdc.value || {};
+    return {
+      continent: b.continent || loc.continent,
+      country: loc.country || b.countryName,
+      region: loc.region || (loc.source === 'ip' && loc.city ? undefined : b.principalSubdivision),
+      city: loc.city || (loc.source === 'ip' ? undefined : b.city || b.locality),
+    };
+  }
   const a = osm.value?.address || {}, b = bdc.value || {};
   const ocean = (b.localityInfo?.informative || []).find((x) => /ocean|sea|gulf|bay/i.test(x.name || ''))?.name;
   const city = a.city || a.town || a.village || a.hamlet || a.municipality || b.city || b.locality || loc.city;
@@ -634,12 +719,14 @@ const WMO = {
 
 let clockTimer;
 async function fillCard() {
-  const loc = state.home, p = state.place;
+  const loc = state.home, p = knownPlace(state.place), level = precisionOf(loc);
   const isShared = loc.source === 'shared';
-  const main = p.hood || p.city || p.region || p.country || p.ocean || 'Somewhere on Earth';
+  const main = p.hood || p.city || p.region || p.country || p.ocean ||
+    (level === 'world' ? `${tzPlace() || 'Your'} time zone` : 'Somewhere on Earth');
   $('place-main').textContent = main;
-  $('place-sub').textContent = [p.city, p.region, p.country].filter((x, i, arr) => x && x !== main && arr.indexOf(x) === i).join(', ') || `${fmtLat(loc.lat)}, ${fmtLon(loc.lon)}`;
-  document.querySelector('.card-kicker').textContent = isShared ? 'A shared place' : 'You are here';
+  $('place-sub').textContent = [p.city, p.region, p.country].filter((x, i, arr) => x && x !== main && arr.indexOf(x) === i).join(', ') ||
+    (level === 'spot' ? `${fmtLat(loc.lat)}, ${fmtLon(loc.lon)}` : `Within about ${fmtDist(loc.accuracy)}`);
+  document.querySelector('.card-kicker').textContent = isShared ? (level === 'spot' ? 'A shared place' : 'A shared area') : (level === 'spot' ? 'You are here' : 'You are somewhere in');
   refreshPrecision();
   poem(loc);
 
@@ -655,8 +742,13 @@ async function fillCard() {
     })
     .catch(() => { $('f-weather').textContent = '—'; startClock(Intl.DateTimeFormat().resolvedOptions().timeZone); });
 
-  getJSON(`https://api.open-meteo.com/v1/elevation?latitude=${loc.lat}&longitude=${loc.lon}`)
+  // Elevation of a centroid is meaningless; for an area show how wide the area is instead.
+  if (level !== 'spot') {
+    $('f-elev-k').textContent = 'Known to within';
+    $('f-elev').textContent = `±${fmtDist(loc.accuracy)}`;
+  } else getJSON(`https://api.open-meteo.com/v1/elevation?latitude=${loc.lat}&longitude=${loc.lon}`)
     .then((e) => {
+      $('f-elev-k').textContent = 'Elevation';
       const m = e.elevation?.[0];
       if (m == null) return;
       $('f-elev').textContent = IMPERIAL ? `${Math.round(m * 3.28084).toLocaleString()} ft` : `${Math.round(m).toLocaleString()} m`;
@@ -680,7 +772,7 @@ function poem(loc) {
   const toPole = haversine(loc, { lat: loc.lat >= 0 ? 90 : -90, lon: 0 });
   const unit = (km) => IMPERIAL ? `${Math.round(km / 1.609).toLocaleString()} mph` : `${Math.round(km).toLocaleString()} km/h`;
   const dist = (m) => IMPERIAL ? `${Math.round(m / 1609.344).toLocaleString()} mi` : `${Math.round(m / 1000).toLocaleString()} km`;
-  const who = loc.source === 'shared' ? 'this spot' : 'you';
+  const who = loc.source === 'shared' ? (precisionOf(loc) === 'spot' ? 'this spot' : 'this area') : 'you';
   $('poem').innerHTML =
     `The ground under ${who} is turning at <b>${unit(spin)}</b> and racing around the Sun at <b>${unit(107_200)}</b>. ` +
     `It's <b>${dist(toPole)}</b> to the ${loc.lat >= 0 ? 'North' : 'South'} Pole. You'd never know any of it from down here.`;
@@ -697,16 +789,20 @@ function refreshPrecision() {
     btn.textContent = 'Find me instead';
   } else if (loc.source === 'gps') {
     if (loc.accuracy <= 100) { box.hidden = true; return; }
-    $('precision-title').textContent = `Landed within ±${fmtDist(loc.accuracy)}`;
-    $('precision-body').textContent = 'Your device is still sharpening its fix. Stepping outside helps.';
+    const spot = precisionOf(loc) === 'spot';
+    $('precision-title').textContent = spot ? `Landed within ±${fmtDist(loc.accuracy)}` : `Your device is unsure · ±${fmtDist(loc.accuracy)}`;
+    $('precision-body').textContent = spot ? 'Your device is still sharpening its fix. Stepping outside helps.'
+      : 'Rather than guess a street, we are showing the whole area it could be. This sharpens as your device gets a better fix.';
     btn.hidden = true;
   } else if (state.gpsDenied) {
-    $('precision-title').textContent = 'Approximate landing';
-    $('precision-body').textContent = 'Location access is turned off for this site. Allow it in your browser settings to land on your exact spot.';
+    $('precision-title').textContent = 'Showing your area, not your street';
+    $('precision-body').textContent = 'Location access is turned off for this site, so we stop at what your connection reveals. Allow it in your browser settings to land on your exact spot.';
     btn.textContent = 'Try again';
   } else {
-    $('precision-title').textContent = 'Approximate landing';
-    $('precision-body').textContent = 'We found you by your internet connection, which is usually right to within a city or so.';
+    $('precision-title').textContent = 'Showing your area, not your street';
+    $('precision-body').textContent = loc.source === 'tz'
+      ? 'All we know so far is your time zone, so that is as close as we go.'
+      : 'Your internet connection only reveals roughly where you are, so we stop at that instead of guessing a street.';
     btn.textContent = 'Land precisely';
   }
 }
@@ -824,12 +920,15 @@ function toggleSound() {
 
 async function share() {
   const loc = state.home; if (!loc) return;
-  const url = `${location.origin}${location.pathname}#@${loc.lat.toFixed(6)},${loc.lon.toFixed(6)}`;
-  const name = state.place.hood || state.place.city || 'a place on Earth';
+  const spot = precisionOf(loc) === 'spot';
+  // an approximate fix is shared as an area (and with fewer decimals): never as a fake exact pin
+  const url = `${location.origin}${location.pathname}#@${loc.lat.toFixed(spot ? 6 : 3)},${loc.lon.toFixed(spot ? 6 : 3)}${spot ? '' : `,~${Math.round(loc.accuracy)}`}`;
+  const kp = knownPlace(state.place);
+  const name = kp.hood || kp.city || kp.region || kp.country || 'a place on Earth';
   try {
     if (navigator.share) { await navigator.share({ title: 'Homeward', text: `Fall from orbit to ${name}`, url }); return; }
     await navigator.clipboard.writeText(url);
-    toast('Link copied. Whoever opens it will fall to this exact spot');
+    toast(spot ? 'Link copied. Whoever opens it will fall to this exact spot' : 'Link copied. It shares your area, not an exact spot');
   } catch (e) { if (e?.name !== 'AbortError') toast(url); }
 }
 
