@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Homeward</title>
+  <meta name="description" content="A descent from orbit to the exact spot where you are standing.">
+  <meta name="theme-color" content="#03050b">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,300;0,9..144,500;1,9..144,300&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <canvas id="stars" aria-hidden="true"></canvas>
+  <div id="map" role="application" aria-label="Satellite map of Earth"></div>
+  <div class="vignette" aria-hidden="true"></div>
+
+  <!-- Opening title -->
+  <section id="intro" class="intro" aria-live="polite">
+    <p class="eyebrow">A journey of roughly 36,000 kilometres</p>
+    <h1 class="wordmark">Homeward</h1>
+    <p class="tagline">Every journey ends somewhere.<br>Let's find yours.</p>
+    <p class="status"><span class="pulse-dot"></span><span id="intro-status">Listening for your signal…</span></p>
+  </section>
+
+  <!-- Cinematic captions during descent -->
+  <div id="title-card" class="title-card" aria-live="polite">
+    <p class="title-kicker" id="title-kicker"></p>
+    <h2 class="title-main" id="title-main"></h2>
+  </div>
+  <div id="milestone" class="milestone" aria-live="polite"></div>
+
+  <!-- Altimeter -->
+  <aside id="altimeter" class="altimeter" aria-label="Altitude">
+    <div class="alt-track">
+      <div class="alt-marks" id="alt-marks"></div>
+      <div class="alt-needle" id="alt-needle"><span></span></div>
+    </div>
+    <div class="alt-readout">
+      <span class="label">Altitude</span>
+      <span class="value mono" id="alt-value">—</span>
+    </div>
+  </aside>
+
+  <!-- Coordinates + signal -->
+  <header class="hud-top">
+    <div class="brand" title="Homeward">
+      <svg viewBox="0 0 32 32" width="22" height="22" aria-hidden="true"><circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".5"/><circle cx="16" cy="16" r="7.5" fill="none" stroke="currentColor" stroke-width="1.6" opacity=".8"/><circle cx="16" cy="16" r="2.6" fill="currentColor"/></svg>
+      <span>Homeward</span>
+    </div>
+    <div class="signal" id="signal">
+      <span class="signal-dot"></span>
+      <span id="signal-text">Locating…</span>
+    </div>
+    <div class="coords mono" id="coords">— · —</div>
+  </header>
+
+  <!-- Landing card -->
+  <section id="card" class="card" aria-live="polite" hidden>
+    <button class="card-handle" id="card-toggle" aria-label="Collapse details" aria-expanded="true"><span></span></button>
+    <p class="card-kicker">You are here</p>
+    <h2 class="card-place" id="place-main">Somewhere on Earth</h2>
+    <p class="card-sub" id="place-sub"></p>
+
+    <div class="card-body" id="card-body">
+      <div class="facts">
+        <div class="fact"><span class="k">Local time</span><span class="v mono" id="f-time">—</span></div>
+        <div class="fact"><span class="k">Right now</span><span class="v" id="f-weather">—</span></div>
+        <div class="fact"><span class="k">Elevation</span><span class="v mono" id="f-elev">—</span></div>
+        <div class="fact"><span class="k">Daylight</span><span class="v mono" id="f-sun">—</span></div>
+      </div>
+
+      <p class="poem" id="poem"></p>
+
+      <div class="precision" id="precision">
+        <div class="precision-text">
+          <strong id="precision-title">Approximate landing</strong>
+          <span id="precision-body">We found you by your internet connection, which is usually accurate to a city or so.</span>
+        </div>
+        <button class="btn btn-accent" id="btn-precise">Land precisely</button>
+      </div>
+
+      <div class="antipode" id="antipode" hidden>
+        <span class="k">Straight through the planet</span>
+        <button class="link" id="btn-antipode"></button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Controls -->
+  <nav class="dock" id="dock" aria-label="Controls" hidden>
+    <button class="dock-btn" id="btn-replay" title="Replay the descent (R)">
+      <svg viewBox="0 0 24 24"><path d="M4 12a8 8 0 1 0 2.4-5.7M4 4v4.5h4.5"/></svg><span>Replay</span>
+    </button>
+    <button class="dock-btn" id="btn-orbit" title="Return to orbit (Esc)">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><ellipse cx="12" cy="12" rx="10" ry="4.2" transform="rotate(-20 12 12)"/></svg><span>Orbit</span>
+    </button>
+    <button class="dock-btn" id="btn-spin" aria-pressed="true" title="Slow drift around your spot (O)">
+      <svg viewBox="0 0 24 24"><path d="M20 12a8 8 0 0 1-14.9 4M4 12a8 8 0 0 1 14.9-4"/><path d="M19 4v4h-4M5 20v-4h4"/></svg><span>Drift</span>
+    </button>
+    <button class="dock-btn" id="btn-labels" aria-pressed="false" title="Show place names (L)">
+      <svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h10M4 18h13"/></svg><span>Labels</span>
+    </button>
+    <button class="dock-btn" id="btn-sound" aria-pressed="false" title="Ambient sound (S)">
+      <svg viewBox="0 0 24 24"><path d="M4 9v6h4l5 4V5L8 9H4z"/><path class="wave" d="M16.5 8.5a5 5 0 0 1 0 7M19 6a8.5 8.5 0 0 1 0 12"/></svg><span>Sound</span>
+    </button>
+    <button class="dock-btn" id="btn-share" title="Share this spot">
+      <svg viewBox="0 0 24 24"><path d="M12 3v12M7 8l5-5 5 5"/><path d="M5 13v6h14v-6"/></svg><span>Share</span>
+    </button>
+    <button class="dock-btn" id="btn-info" title="About">
+      <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.01"/></svg><span>About</span>
+    </button>
+  </nav>
+
+  <div id="toast" class="toast" role="status"></div>
+
+  <dialog id="about" class="about">
+    <form method="dialog">
+      <h2>Homeward</h2>
+      <p>A single, unbroken fall from orbit to the ground beneath your feet.</p>
+      <h3>How we find you</h3>
+      <p>First a rough guess from your time zone, then your internet connection, and finally &mdash; if you allow it &mdash; your device's own location, which can be accurate to a few metres.</p>
+      <h3>Your privacy</h3>
+      <p>Nothing is stored and there is no account. To draw the page your browser asks a few public services for help: satellite imagery from Esri, place names from OpenStreetMap Nominatim and BigDataCloud, weather and elevation from Open-Meteo, and an IP lookup from ipwho.is or GeoJS.</p>
+      <h3>Keys</h3>
+      <p class="keys"><kbd>R</kbd> replay · <kbd>Esc</kbd> orbit · <kbd>O</kbd> drift · <kbd>L</kbd> labels · <kbd>S</kbd> sound</p>
+      <button class="btn btn-accent" value="close">Back to Earth</button>
+    </form>
+  </dialog>
+
+  <script src="https://unpkg.com/maplibre-gl@5.6.0/dist/maplibre-gl.js"></script>
+  <script type="module" src="app.js"></script>
+</body>
+</html>
