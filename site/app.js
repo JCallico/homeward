@@ -13,6 +13,9 @@ const ATTRIB = 'Imagery © <a href="https://www.esri.com">Esri</a>, Maxar, Earth
 
 const EARTH_C = 40075016.686;      // equatorial circumference, metres
 const ORBIT_ZOOM = innerWidth < 720 ? 0.9 : 1.7;
+const MERC_MAX = 85.051129;
+const NIGHT_MAX = 0.66;   // darkest the night side gets
+const NIGHT_CORNERS = [[-180, MERC_MAX], [180, MERC_MAX], [180, -MERC_MAX], [-180, -MERC_MAX]];
 const BASE_TILE_MAX = 19;          // Esri World Imagery is global to tile z19
 const isPhone = () => innerWidth < 720;
 /** Keep the beacon in the open part of the screen, clear of the landing card. */
@@ -141,14 +144,20 @@ const map = new maplibregl.Map({
     sources: {
       sat: { type: 'raster', tiles: [IMAGERY], tileSize: 256, maxzoom: BASE_TILE_MAX, attribution: ATTRIB },
       places: { type: 'raster', tiles: [PLACES], tileSize: 256, maxzoom: 19 },
-      night: { type: 'geojson', data: nightPolygon(new Date()) },
+      night: { type: 'image', url: nightImage(new Date()), coordinates: NIGHT_CORNERS },
+      caps: { type: 'geojson', data: polarCaps(new Date()) },
       accuracy: { type: 'geojson', data: { type: 'FeatureCollection', features: [] } },
     },
     layers: [
       { id: 'sat', type: 'raster', source: 'sat', paint: { 'raster-fade-duration': 250, 'raster-saturation': 0.08, 'raster-contrast': 0.06 } },
-      { id: 'night', type: 'fill', source: 'night', maxzoom: 7,
-        paint: { 'fill-color': '#020611', 'fill-antialias': false,
-          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 0, ['get', 'o'], 3, ['*', ['get', 'o'], 0.8], 5.5, ['*', ['get', 'o'], 0.3], 7, 0] } },
+      // Imagery (like any Web Mercator source) stops at ±85°; without this the globe smears the last pixel row into a striped disc at each pole.
+      { id: 'caps', type: 'fill', source: 'caps', paint: { 'fill-color': ['get', 'color'], 'fill-antialias': false } },
+      { id: 'caps-night', type: 'fill', source: 'caps', maxzoom: 7,
+        paint: { 'fill-color': '#020611', 'fill-antialias': false,   // same fade curve as the night raster
+          'fill-opacity': ['interpolate', ['linear'], ['zoom'], 0, ['get', 'shade'], 3, ['*', ['get', 'shade'], 0.85], 5.5, ['*', ['get', 'shade'], 0.35], 7, 0] } },
+      { id: 'night', type: 'raster', source: 'night', maxzoom: 7,
+        paint: { 'raster-fade-duration': 0, 'raster-resampling': 'linear',
+          'raster-opacity': ['interpolate', ['linear'], ['zoom'], 0, 1, 3, 0.85, 5.5, 0.35, 7, 0] } },
       { id: 'places', type: 'raster', source: 'places', layout: { visibility: 'none' }, paint: { 'raster-opacity': 0.92 } },
       { id: 'acc-fill', type: 'fill', source: 'accuracy', paint: { 'fill-color': '#ffcf8a', 'fill-opacity': 0.08 } },
       { id: 'acc-line', type: 'line', source: 'accuracy', paint: { 'line-color': '#ffcf8a', 'line-opacity': 0.7, 'line-width': 1.5, 'line-dasharray': [2, 2] } },
@@ -157,33 +166,58 @@ const map = new maplibregl.Map({
 });
 map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right');
 map.on('move', onMove);
-setInterval(() => map.getSource('night')?.setData(nightPolygon(new Date())), 60_000);
+setInterval(() => {
+  const now = new Date();
+  map.getSource('night')?.updateImage({ url: nightImage(now), coordinates: NIGHT_CORNERS });
+  map.getSource('caps')?.setData(polarCaps(now));
+}, 60_000);
 
 /**
- * Night, drawn as three stacked shadows (sunset, civil and nautical twilight)
- * so the terminator fades softly instead of ending in a hard line.
+ * Night as a smooth shadow: every pixel's darkness follows the Sun's elevation there,
+ * fading from just above the horizon down through astronomical twilight. Drawn in Web
+ * Mercator rows so the image lines up exactly with the map; there are no edges to see.
  */
-function nightPolygon(date) {
-  const { lat: dec, lon: sLon } = subsolarPoint(date);
-  const r = Math.PI / 180, A = Math.sin(dec * r), nightPoleNorth = dec < 0;
-  const pole = nightPoleNorth ? 89.9 : -89.9;
-  const band = (h, o) => {
+/** Sun-elevation → shadow strength (0 day … 1 deep night), shared by the night image and the caps. */
+function nightAlpha(elevDeg) {
+  const t = Math.min(1, Math.max(0, (2 - elevDeg) / 16));   // 0 at +2°, 1 at −14°
+  return t * t * (3 - 2 * t);
+}
+
+/** Solid caps over both poles, coloured like the surrounding imagery and shaded for day or night. */
+function polarCaps(date) {
+  const { lat: dec } = subsolarPoint(date);
+  const cap = (edge, pole, rgb, elev) => {
     const ring = [];
-    for (let lon = -180; lon <= 180; lon += 2) {
-      // sun elevation along this meridian: R·cos(φ − β); night is where it drops below h
-      const B = Math.cos(dec * r) * Math.cos((lon - sLon) * r);
-      const R = Math.hypot(A, B), beta = Math.atan2(A, B) / r;
-      const k = Math.sin(h * r) / R;
-      let lat;
-      if (k >= 1) lat = -pole;                 // whole meridian below h
-      else if (k <= -1) lat = pole;            // none of it
-      else lat = beta + (nightPoleNorth ? 1 : -1) * Math.acos(k) / r;
-      ring.push([lon, Math.max(-89.9, Math.min(89.9, lat))]);
-    }
+    for (let lon = -180; lon <= 180; lon += 5) ring.push([lon, edge]);
     ring.push([180, pole], [-180, pole], ring[0]);
-    return { type: 'Feature', properties: { o }, geometry: { type: 'Polygon', coordinates: [ring] } };
+    return { type: 'Feature', properties: { color: `rgb(${rgb.join(',')})`, shade: nightAlpha(elev) * NIGHT_MAX }, geometry: { type: 'Polygon', coordinates: [ring] } };
   };
-  return { type: 'FeatureCollection', features: [band(0, 0.34), band(-6, 0.28), band(-12, 0.3)] };
+  return { type: 'FeatureCollection', features: [
+    cap(MERC_MAX - 0.02, 89.9, [10, 74, 96], dec),         // Arctic Ocean
+    cap(-(MERC_MAX - 0.02), -89.9, [222, 230, 236], -dec), // Antarctic ice sheet
+  ] };
+}
+
+function nightImage(date) {
+  const W = 1024, H = 1024, r = Math.PI / 180;
+  const { lat: dec, lon: sLon } = subsolarPoint(date);
+  const sd = Math.sin(dec * r), cd = Math.cos(dec * r);
+  const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+  const cx = cv.getContext('2d'), img = cx.createImageData(W, H), d = img.data;
+  const cosH = new Float32Array(W);
+  for (let x = 0; x < W; x++) cosH[x] = Math.cos(((x + 0.5) / W * 360 - 180 - sLon) * r);
+  const MAX = NIGHT_MAX * 255;
+  for (let y = 0; y < H; y++) {
+    const lat = Math.atan(Math.sinh(Math.PI * (1 - 2 * (y + 0.5) / H)));
+    const a = Math.sin(lat) * sd, b = Math.cos(lat) * cd;
+    for (let x = 0; x < W; x++) {
+      const elev = Math.asin(Math.max(-1, Math.min(1, a + b * cosH[x]))) / r;   // degrees
+      const i = (y * W + x) * 4;
+      d[i] = 2; d[i + 1] = 6; d[i + 2] = 17; d[i + 3] = nightAlpha(elev) * MAX;
+    }
+  }
+  cx.putImageData(img, 0, 0);
+  return cv.toDataURL('image/png');
 }
 function subsolarPoint(date) {
   const start = Date.UTC(date.getUTCFullYear(), 0, 0);
